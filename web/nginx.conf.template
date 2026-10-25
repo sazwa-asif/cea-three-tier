@@ -1,0 +1,24 @@
+server {
+    listen 80;
+    resolver ${DNS_RESOLVER} valid=10s;
+    set $app_upstream "${APP_UPSTREAM}";
+    add_header X-Web-Host $hostname always;
+
+    location = /health {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok";
+    }
+
+    location /api/ {
+        proxy_pass http://$app_upstream;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_connect_timeout 5s;
+    }
+
+    location / {
+        root /usr/share/nginx/html;
+        index index.html;
+    }
+}

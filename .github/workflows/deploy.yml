@@ -1,0 +1,67 @@
+name: build-test-deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # lets the job obtain short-lived AWS credentials (OIDC); no stored access keys
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r app/requirements.txt pytest
+      - run: pytest -q
+        working-directory: app
+
+  build-push-deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push both images
+        run: |
+          REG=${{ steps.ecr.outputs.registry }}
+          for t in web app; do
+            docker build -t $REG/cea-$t:${{ github.sha }} -t $REG/cea-$t:latest ./$t
+            docker push $REG/cea-$t:${{ github.sha }}
+            docker push $REG/cea-$t:latest
+          done
+
+      - name: Deploy (pull the new image on every instance of a tier)
+        run: |
+          for tier in app web; do
+            CMD=$(aws ssm send-command --document-name AWS-RunShellScript \
+              --targets "Key=tag:Tier,Values=$tier" "Key=tag:Project,Values=cea" \
+              --parameters 'commands=["/opt/cea/deploy.sh"]' \
+              --query Command.CommandId --output text)
+            echo "$tier command $CMD"
+            for i in $(seq 1 40); do
+              sleep 10
+              ST=$(aws ssm list-command-invocations --command-id $CMD --query 'CommandInvocations[].Status' --output text)
+              echo "  $tier: $ST"
+              case "$ST" in
+                *Failed*|*Cancelled*|*TimedOut*) echo "deploy failed on tier $tier"; exit 1 ;;
+              esac
+              if [ -n "$ST" ] && ! echo "$ST" | grep -qE 'Pending|InProgress|Delayed'; then break; fi
+            done
+          done

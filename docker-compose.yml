@@ -1,0 +1,44 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ceadb
+      POSTGRES_USER: ceaadmin
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?copy .env.example to .env and set POSTGRES_PASSWORD}
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ceaadmin -d ceadb"]
+      interval: 5s
+      retries: 12
+
+  app:
+    build: ./app
+    environment:
+      DB_HOST: db
+      DB_NAME: ceadb
+      DB_USER: ceaadmin
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [frontend, backend]
+
+  web:
+    build: ./web
+    ports:
+      - "8080:80"
+    environment:
+      APP_UPSTREAM: app:5000
+      DNS_RESOLVER: 127.0.0.11
+    depends_on:
+      - app
+    networks: [frontend]
+
+networks:
+  frontend:
+  backend:
+
+volumes:
+  dbdata:

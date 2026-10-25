@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Three-Tier Notes</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+    form { display: flex; gap: .5rem; }
+    input { flex: 1; padding: .5rem; }
+    button { padding: .5rem 1rem; }
+    li { margin: .4rem 0; }
+    small { color: #666; }
+    #who { background: #f2f2f2; padding: .6rem; border-radius: 6px; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <h1>Three-Tier Notes</h1>
+  <p id="who">loading...</p>
+  <form id="f">
+    <input id="t" maxlength="500" placeholder="Write a note" required>
+    <button>Save</button>
+  </form>
+  <ul id="list"></ul>
+  <script>
+    async function info() {
+      const r = await fetch('/api/info');
+      document.getElementById('who').textContent =
+        'Web server: ' + (r.headers.get('X-Web-Host') || '?') + '   |   App server: ' + (await r.json()).host;
+    }
+    async function load() {
+      const r = await fetch('/api/notes');
+      const rows = await r.json();
+      document.getElementById('list').innerHTML = rows.map(n =>
+        '<li>' + n.text.replace(/</g, '&lt;') + ' <small>(saved via ' + n.served_by + ')</small></li>').join('');
+    }
+    document.getElementById('f').addEventListener('submit', async e => {
+      e.preventDefault();
+      await fetch('/api/notes', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                 body: JSON.stringify({text: document.getElementById('t').value})});
+      document.getElementById('t').value = '';
+      info(); load();
+    });
+    info(); load();
+  </script>
+</body>
+</html>

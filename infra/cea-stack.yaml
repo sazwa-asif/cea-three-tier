@@ -1,0 +1,546 @@
+﻿AWSTemplateFormatVersion: '2010-09-09'
+Description: CEA - three-tier web application (web, application, database) on AWS with CI/CD deploy role
+
+Parameters:
+  GitHubRepo:
+    Type: String
+    Description: owner/repository that is allowed to deploy (GitHub Actions OIDC), e.g. myuser/cea-three-tier
+  InstanceType:
+    Type: String
+    Default: t3.small
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+  WebDesired:
+    Type: Number
+    Default: 2
+  AppDesired:
+    Type: Number
+    Default: 2
+  MaxPerTier:
+    Type: Number
+    Default: 3
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+  # ---------------------------------------------------------------- network
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: cea-vpc}, {Key: Project, Value: cea}]
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{Key: Name, Value: cea-igw}, {Key: Project, Value: cea}]
+
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref Vpc, InternetGatewayId: !Ref Igw}
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: cea-public-a}, {Key: Project, Value: cea}]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: cea-public-b}, {Key: Project, Value: cea}]
+  AppSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{Key: Name, Value: cea-private-app-a}, {Key: Project, Value: cea}]
+  AppSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{Key: Name, Value: cea-private-app-b}, {Key: Project, Value: cea}]
+  DbSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.21.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{Key: Name, Value: cea-private-db-a}, {Key: Project, Value: cea}]
+  DbSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.22.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{Key: Name, Value: cea-private-db-b}, {Key: Project, Value: cea}]
+
+  PublicRt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: cea-public-rt}, {Key: Project, Value: cea}]
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties: {RouteTableId: !Ref PublicRt, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref Igw}
+  PublicRtA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRt}
+  PublicRtB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRt}
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: IgwAttach
+    Properties:
+      Domain: vpc
+  NatGw:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags: [{Key: Name, Value: cea-nat}, {Key: Project, Value: cea}]
+
+  PrivateRt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: cea-private-app-rt}, {Key: Project, Value: cea}]
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties: {RouteTableId: !Ref PrivateRt, DestinationCidrBlock: 0.0.0.0/0, NatGatewayId: !Ref NatGw}
+  PrivateRtA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref AppSubnetA, RouteTableId: !Ref PrivateRt}
+  PrivateRtB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref AppSubnetB, RouteTableId: !Ref PrivateRt}
+
+  DbRt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: cea-db-rt-no-internet}, {Key: Project, Value: cea}]
+  DbRtA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref DbSubnetA, RouteTableId: !Ref DbRt}
+  DbRtB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref DbSubnetB, RouteTableId: !Ref DbRt}
+
+  # ------------------------------------------------- security groups (per tier)
+  WebAlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public load balancer - HTTP from the internet
+      VpcId: !Ref Vpc
+      SecurityGroupIngress: [{IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}]
+      Tags: [{Key: Name, Value: cea-web-alb-sg}, {Key: Project, Value: cea}]
+  WebSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web tier - HTTP only from the public load balancer
+      VpcId: !Ref Vpc
+      SecurityGroupIngress: [{IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref WebAlbSg}]
+      Tags: [{Key: Name, Value: cea-web-sg}, {Key: Project, Value: cea}]
+  AppAlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal load balancer - HTTP only from the web tier
+      VpcId: !Ref Vpc
+      SecurityGroupIngress: [{IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref WebSg}]
+      Tags: [{Key: Name, Value: cea-app-alb-sg}, {Key: Project, Value: cea}]
+  AppSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Application tier - port 5000 only from the internal load balancer
+      VpcId: !Ref Vpc
+      SecurityGroupIngress: [{IpProtocol: tcp, FromPort: 5000, ToPort: 5000, SourceSecurityGroupId: !Ref AppAlbSg}]
+      Tags: [{Key: Name, Value: cea-app-sg}, {Key: Project, Value: cea}]
+  DbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Database - PostgreSQL only from the application tier
+      VpcId: !Ref Vpc
+      SecurityGroupIngress: [{IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref AppSg}]
+      Tags: [{Key: Name, Value: cea-db-sg}, {Key: Project, Value: cea}]
+
+  # ---------------------------------------------------- secrets and database
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-db-credentials'
+      Description: Generated database credentials (never stored in code)
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"ceaadmin"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludeCharacters: '"@/\'''
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private database subnets
+      SubnetIds: [!Ref DbSubnetA, !Ref DbSubnetB]
+
+  Db:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      Engine: postgres
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: '20'
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: ceadb
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:password}}'
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSg]
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+
+  # --------------------------------------------------------- container registry
+  EcrWeb:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: cea-web
+      EmptyOnDelete: true
+      ImageScanningConfiguration: {ScanOnPush: true}
+  EcrApp:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: cea-app
+      EmptyOnDelete: true
+      ImageScanningConfiguration: {ScanOnPush: true}
+
+  # ----------------------------------------------------- logs and instance role
+  WebLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: /cea/web, RetentionInDays: 3}
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: /cea/app, RetentionInDays: 3}
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: 'sts:AssumeRole'}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Policies:
+        - PolicyName: cea-instance-least-privilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DbSecret
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource:
+                  - !GetAtt WebLogGroup.Arn
+                  - !GetAtt AppLogGroup.Arn
+                  - !Sub '${WebLogGroup.Arn}:*'
+                  - !Sub '${AppLogGroup.Arn}:*'
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref InstanceRole]}
+
+  # --------------------------------------------------------------- load balancers
+  WebAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref WebAlbSg]
+      Tags: [{Key: Name, Value: cea-web-alb}, {Key: Project, Value: cea}]
+  WebTg:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes: [{Key: deregistration_delay.timeout_seconds, Value: '20'}]
+  WebListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WebAlb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref WebTg}]
+
+  AppAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internal
+      Subnets: [!Ref AppSubnetA, !Ref AppSubnetB]
+      SecurityGroups: [!Ref AppAlbSg]
+      Tags: [{Key: Name, Value: cea-app-alb-internal}, {Key: Project, Value: cea}]
+  AppTg:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Protocol: HTTP
+      Port: 5000
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes: [{Key: deregistration_delay.timeout_seconds, Value: '20'}]
+  AppListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref AppAlb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref AppTg}]
+
+  # --------------------------------------------------- compute: launch templates + ASGs
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: {Arn: !GetAtt InstanceProfile.Arn}
+        MetadataOptions: {HttpTokens: required, HttpPutResponseHopLimit: 2}
+        NetworkInterfaces:
+          - {DeviceIndex: 0, AssociatePublicIpAddress: true, Groups: [!Ref WebSg]}
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{Key: Name, Value: cea-web}, {Key: Tier, Value: web}, {Key: Project, Value: cea}]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -ux
+            dnf install -y docker
+            systemctl enable --now docker
+            mkdir -p /opt/cea
+            cat > /opt/cea/deploy.sh <<'EOS'
+            #!/bin/bash
+            set -euo pipefail
+            REG=${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+            aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin $REG
+            docker pull $REG/cea-web:latest
+            docker rm -f web 2>/dev/null || true
+            docker run -d --name web --restart always -p 80:80 \
+              -e APP_UPSTREAM=${AppAlb.DNSName} -e DNS_RESOLVER=169.254.169.253 \
+              --log-driver awslogs --log-opt awslogs-region=${AWS::Region} --log-opt awslogs-group=${WebLogGroup} \
+              $REG/cea-web:latest
+            EOS
+            chmod +x /opt/cea/deploy.sh
+            nohup bash -c 'until /opt/cea/deploy.sh; do sleep 30; done' > /var/log/cea-deploy.log 2>&1 &
+
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: {Arn: !GetAtt InstanceProfile.Arn}
+        MetadataOptions: {HttpTokens: required, HttpPutResponseHopLimit: 2}
+        SecurityGroupIds: [!Ref AppSg]
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{Key: Name, Value: cea-app}, {Key: Tier, Value: app}, {Key: Project, Value: cea}]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -ux
+            dnf install -y docker
+            systemctl enable --now docker
+            mkdir -p /opt/cea
+            cat > /opt/cea/deploy.sh <<'EOS'
+            #!/bin/bash
+            set -euo pipefail
+            REG=${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+            aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin $REG
+            docker pull $REG/cea-app:latest
+            docker rm -f app 2>/dev/null || true
+            docker run -d --name app --restart always -p 5000:5000 \
+              -e DB_HOST=${Db.Endpoint.Address} -e DB_NAME=ceadb \
+              -e DB_SECRET_ARN=${DbSecret} -e AWS_REGION=${AWS::Region} \
+              --log-driver awslogs --log-opt awslogs-region=${AWS::Region} --log-opt awslogs-group=${AppLogGroup} \
+              $REG/cea-app:latest
+            EOS
+            chmod +x /opt/cea/deploy.sh
+            nohup bash -c 'until /opt/cea/deploy.sh; do sleep 30; done' > /var/log/cea-deploy.log 2>&1 &
+
+  WebAsg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: !Ref WebDesired
+      DesiredCapacity: !Ref WebDesired
+      MaxSize: !Ref MaxPerTier
+      VPCZoneIdentifier: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs: [!Ref WebTg]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags: [{Key: Name, Value: cea-web, PropagateAtLaunch: true}]
+  AppAsg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: !Ref AppDesired
+      DesiredCapacity: !Ref AppDesired
+      MaxSize: !Ref MaxPerTier
+      VPCZoneIdentifier: [!Ref AppSubnetA, !Ref AppSubnetB]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs: [!Ref AppTg]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags: [{Key: Name, Value: cea-app, PropagateAtLaunch: true}]
+
+  WebScaling:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WebAsg
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification: {PredefinedMetricType: ASGAverageCPUUtilization}
+        TargetValue: 50
+  AppScaling:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AppAsg
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification: {PredefinedMetricType: ASGAverageCPUUtilization}
+        TargetValue: 50
+
+  # ------------------------------------------------- CI/CD deploy role (GitHub OIDC)
+  # One-time prerequisite (console): IAM > Identity providers > Add provider > OpenID Connect,
+  # URL https://token.actions.githubusercontent.com, audience sts.amazonaws.com.
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-github-deploy'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals: {'token.actions.githubusercontent.com:aud': sts.amazonaws.com}
+              StringLike: {'token.actions.githubusercontent.com:sub': !Sub 'repo:${GitHubRepo}:*'}
+      Policies:
+        - PolicyName: cea-pipeline-least-privilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: ecr:GetAuthorizationToken, Resource: '*'}
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: [!GetAtt EcrWeb.Arn, !GetAtt EcrApp.Arn]
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}::document/AWS-RunShellScript'
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+                Condition: {StringEquals: {'ssm:resourceTag/Project': cea}}
+              - {Effect: Allow, Action: [ssm:ListCommandInvocations, ssm:GetCommandInvocation, ec2:DescribeInstances], Resource: '*'}
+
+  # ------------------------------------------------------------------ monitoring
+  UnhealthyWebAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: cea-web-unhealthy-hosts
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - {Name: TargetGroup, Value: !GetAtt WebTg.TargetGroupFullName}
+        - {Name: LoadBalancer, Value: !GetAtt WebAlb.LoadBalancerFullName}
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: cea-web-5xx
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions: [{Name: LoadBalancer, Value: !GetAtt WebAlb.LoadBalancerFullName}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: cea-three-tier
+      DashboardBody: !Sub |
+        {"widgets":[
+          {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"Requests and healthy web hosts","region":"${AWS::Region}","stat":"Sum","period":60,
+            "metrics":[["AWS/ApplicationELB","RequestCount","LoadBalancer","${WebAlb.LoadBalancerFullName}"],
+                       ["AWS/ApplicationELB","HealthyHostCount","TargetGroup","${WebTg.TargetGroupFullName}","LoadBalancer","${WebAlb.LoadBalancerFullName}",{"stat":"Average"}]]}},
+          {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Response time","region":"${AWS::Region}","stat":"Average","period":60,
+            "metrics":[["AWS/ApplicationELB","TargetResponseTime","LoadBalancer","${WebAlb.LoadBalancerFullName}"]]}},
+          {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"Auto Scaling group CPU","region":"${AWS::Region}","stat":"Average","period":60,
+            "metrics":[["AWS/EC2","CPUUtilization","AutoScalingGroupName","${WebAsg}"],["AWS/EC2","CPUUtilization","AutoScalingGroupName","${AppAsg}"]]}},
+          {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"Database","region":"${AWS::Region}","stat":"Average","period":60,
+            "metrics":[["AWS/RDS","CPUUtilization","DBInstanceIdentifier","${Db}"],["AWS/RDS","DatabaseConnections","DBInstanceIdentifier","${Db}"]]}}
+        ]}
+
+Outputs:
+  SiteUrl:
+    Description: Open this in a browser
+    Value: !Sub 'http://${WebAlb.DNSName}'
+  EcrWebUri:
+    Value: !GetAtt EcrWeb.RepositoryUri
+  EcrAppUri:
+    Value: !GetAtt EcrApp.RepositoryUri
+  GitHubDeployRoleArn:
+    Description: Put this in the GitHub secret AWS_ROLE_ARN
+    Value: !GetAtt GitHubDeployRole.Arn
+  DbEndpoint:
+    Value: !GetAtt Db.Endpoint.Address
