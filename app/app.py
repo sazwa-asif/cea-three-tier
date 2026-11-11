@@ -47,17 +47,17 @@ def ensure_table():
             conn.close()
         _table_ready = True
 
-
+#Checks whether the backend is running.
 @app.get("/health")
 def health():
     return jsonify(status="ok", tier="app", host=socket.gethostname())
 
-
+#get backend info
 @app.get("/api/info")
 def info():
     return jsonify(tier="app", host=socket.gethostname())
 
-
+# check backend is ready to serve requests 
 @app.get("/api/ready")
 def ready():
     try:
